@@ -210,6 +210,3 @@ Contributions are welcome! Please feel free to submit a Pull Request. For major 
 ## Support
 
 If you encounter any issues or have questions, please open an issue on the GitHub repository.
-
-Sources
-[1] translate-filenames.py https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/709294/b604451a-3083-44de-910a-bca2037e25b6/translate-filenames.py
