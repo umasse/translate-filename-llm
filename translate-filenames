@@ -1,0 +1,577 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+import argparse
+import json
+import logging
+import os
+import re
+import subprocess
+import sys
+import time
+from collections import defaultdict
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from typing import List, Dict, Tuple, Optional, Set
+
+# Constants
+DEFAULT_MAX_LENGTH = 100
+DEFAULT_MAX_EXTENSIONS = 2
+DEFAULT_DELAY = 0.0
+EXTENSION_MAX_CHARS = 7
+LLM_TIMEOUT = 30
+
+# Compiled regex patterns for better performance
+class RegexPatterns:
+    YOUTUBE_ID = re.compile(r'\b[a-zA-Z0-9_-]{11}\b')
+    UUID = re.compile(r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b')
+    HASH_TAG = re.compile(r'#([a-zA-Z0-9_-]+)')
+    BRACKETED = re.compile(r'[\[\(]([a-zA-Z0-9_-]+)[\]\)]')
+    PROBLEMATIC_CHARS = re.compile(r'[<>:"/\\|?*]')
+    WHITESPACE = re.compile(r'\s+')
+    CLEANUP = re.compile(r'[|\[\]()#]+')
+    UNDERSCORE_CLEANUP = re.compile(r'_+')
+    SAFE_CHARS = re.compile(r'[^\w\-_.]')
+
+# Setup logging
+logger = logging.getLogger(__name__)
+
+class IDType(Enum):
+    YOUTUBE = "youtube"
+    UUID = "uuid"
+    NUMERIC = "numeric"
+    MIXED = "mixed"
+    BRACKETED = "bracketed"
+    HASH = "hash"
+    CUSTOM = "custom"
+
+@dataclass
+class IDConfig:
+    youtube: bool = False
+    uuid: bool = False
+    numeric: bool = False
+    numeric_min_length: int = 6
+    mixed: bool = False
+    mixed_min_length: int = 8
+    bracketed: bool = False
+    bracketed_min_length: int = 3
+    hash: bool = False
+    hash_min_length: int = 6
+    custom_pattern: Optional[str] = None
+    
+    def has_any_enabled(self) -> bool:
+        return any([
+            self.youtube, self.uuid, self.numeric, self.mixed,
+            self.bracketed, self.hash, bool(self.custom_pattern)
+        ])
+
+@dataclass
+class ProcessingConfig:
+    max_length: int = DEFAULT_MAX_LENGTH
+    max_extensions: int = DEFAULT_MAX_EXTENSIONS
+    delay: float = DEFAULT_DELAY
+    auto_accept: bool = False
+    model: Optional[str] = None
+    template: Optional[str] = None
+    debug: bool = False
+
+def setup_logging(debug: bool) -> None:
+    """Setup logging configuration"""
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format='%(levelname)s: %(message)s'
+    )
+
+class FileExtractor:
+    """Handles file extension extraction"""
+    
+    @staticmethod
+    def extract_extensions(filename: str, max_extensions: int = DEFAULT_MAX_EXTENSIONS) -> Tuple[str, str]:
+        """Extract extensions dynamically by detecting short parts at the end"""
+        parts = filename.split('.')
+        if len(parts) == 1:
+            return filename, ''
+        
+        extensions = []
+        count = 0
+        # Start from the end, collect extensions while they are short (1-5 chars) and under limit
+        for part in reversed(parts[1:]):
+            if 1 <= len(part) <= EXTENSION_MAX_CHARS and count < max_extensions:
+                extensions.insert(0, '.' + part)
+                count += 1
+            else:
+                break
+        
+        base_len = len(filename) - sum(len(ext) for ext in extensions)
+        base = filename[:base_len]
+        ext = ''.join(extensions)
+        return base, ext
+    
+    @staticmethod
+    def extract_base_name(filename: str, max_extensions: int = DEFAULT_MAX_EXTENSIONS) -> str:
+        """Extract just the base name without extensions"""
+        base, _ = FileExtractor.extract_extensions(filename, max_extensions)
+        return base
+
+class IDExtractor:
+    """Handles unique ID extraction from filenames"""
+    
+    @staticmethod
+    def extract_youtube_ids(text: str) -> List[str]:
+        """Extract YouTube-style IDs (11 characters, alphanumeric + underscore/dash)"""
+        return RegexPatterns.YOUTUBE_ID.findall(text)
+    
+    @staticmethod
+    def extract_uuids(text: str) -> List[str]:
+        """Extract UUIDs (standard format)"""
+        return RegexPatterns.UUID.findall(text)
+    
+    @staticmethod
+    def extract_numeric_ids(text: str, min_length: int = 6) -> List[str]:
+        """Extract numeric IDs (6+ digits by default)"""
+        pattern = re.compile(rf'\b\d{{{min_length},}}\b')
+        return pattern.findall(text)
+    
+    @staticmethod
+    def extract_mixed_ids(text: str, min_length: int = 8) -> List[str]:
+        """Extract mixed alphanumeric IDs (contain both letters and numbers)"""
+        pattern = re.compile(rf'\b(?=.*[0-9])(?=.*[a-zA-Z])[a-zA-Z0-9_-]{{{min_length},}}\b')
+        return pattern.findall(text)
+    
+    @staticmethod
+    def extract_bracketed_ids(text: str, min_length: int = 3) -> List[str]:
+        """Extract IDs enclosed in brackets or parentheses"""
+        pattern = re.compile(rf'[\[\(]([a-zA-Z0-9_-]{{{min_length},}})[\]\)]')
+        return pattern.findall(text)
+    
+    @staticmethod
+    def extract_hash_ids(text: str, min_length: int = 6) -> List[str]:
+        """Extract IDs that start with # (hashtag-style)"""
+        pattern = re.compile(rf'#([a-zA-Z0-9_-]{{{min_length},}})')
+        return pattern.findall(text)
+    
+    @staticmethod
+    def extract_custom_ids(text: str, pattern: str) -> List[str]:
+        """Extract IDs using a custom regex pattern"""
+        try:
+            custom_pattern = re.compile(pattern)
+            return custom_pattern.findall(text)
+        except re.error as e:
+            logger.error(f"Error in custom pattern '{pattern}': {e}")
+            return []
+    
+    @classmethod
+    def extract_unique_ids(cls, text: str, id_config: IDConfig) -> List[str]:
+        """Extract unique IDs based on configuration"""
+        ids = []
+        
+        if id_config.youtube:
+            ids.extend(cls.extract_youtube_ids(text))
+        
+        if id_config.uuid:
+            ids.extend(cls.extract_uuids(text))
+        
+        if id_config.numeric:
+            ids.extend(cls.extract_numeric_ids(text, id_config.numeric_min_length))
+        
+        if id_config.mixed:
+            ids.extend(cls.extract_mixed_ids(text, id_config.mixed_min_length))
+        
+        if id_config.bracketed:
+            ids.extend(cls.extract_bracketed_ids(text, id_config.bracketed_min_length))
+        
+        if id_config.hash:
+            ids.extend(cls.extract_hash_ids(text, id_config.hash_min_length))
+        
+        if id_config.custom_pattern:
+            ids.extend(cls.extract_custom_ids(text, id_config.custom_pattern))
+        
+        # Remove duplicates while preserving order
+        unique_ids = []
+        for id_val in ids:
+            if id_val not in unique_ids:
+                unique_ids.append(id_val)
+        
+        return unique_ids
+
+class TextProcessor:
+    """Handles text processing and sanitization"""
+    
+    @staticmethod
+    def remove_ids_from_text(text: str, ids: List[str]) -> str:
+        """Remove identified IDs from text for translation"""
+        if not ids:
+            # If no IDs to remove, just clean up the text lightly
+            result = re.sub(r'[#]+', ' ', text)  # Remove standalone # symbols
+            result = RegexPatterns.WHITESPACE.sub(' ', result)
+            return result.strip()
+        
+        result = text
+        for id_val in ids:
+            # Remove the ID and any surrounding brackets/parentheses/hash
+            patterns = [
+                rf'\[{re.escape(id_val)}\]',
+                rf'\({re.escape(id_val)}\)',
+                rf'#{re.escape(id_val)}\b',
+                rf'\b{re.escape(id_val)}\b'
+            ]
+            for pattern in patterns:
+                result = re.sub(pattern, '', result)
+        
+        # Clean up extra spaces and punctuation
+        result = RegexPatterns.WHITESPACE.sub(' ', result)
+        result = RegexPatterns.CLEANUP.sub(' ', result)
+        return result.strip()
+    
+    @staticmethod
+    def sanitize_filename(filename: str) -> str:
+        """Sanitize filename for cross-platform compatibility"""
+        # Replace problematic characters
+        filename = RegexPatterns.PROBLEMATIC_CHARS.sub('', filename)
+        filename = RegexPatterns.WHITESPACE.sub('_', filename)
+        filename = RegexPatterns.SAFE_CHARS.sub('', filename)
+        filename = RegexPatterns.UNDERSCORE_CLEANUP.sub('_', filename)
+        return filename.strip('_-.')
+
+class LLMCaller:
+    """Handles LLM API calls"""
+    
+    @staticmethod
+    def call_llm(text: str, model: Optional[str] = None, template: Optional[str] = None) -> str:
+        """Call the llm tool with proper error handling"""
+        cmd = ['llm']
+        
+        if template:
+            cmd.extend(['-t', template])
+        if model:
+            cmd.extend(['-m', model])
+        
+        try:
+            if template:
+                result = subprocess.run(
+                    cmd, 
+                    input=text, 
+                    text=True, 
+                    capture_output=True, 
+                    check=True,
+                    timeout=LLM_TIMEOUT
+                )
+            else:
+                prompt = f'Translate this filename to English, without the extension or unique ID: "{text}". Only return the translated filename, no extra text.'
+                cmd.append(prompt)
+                result = subprocess.run(
+                    cmd, 
+                    text=True, 
+                    capture_output=True, 
+                    check=True,
+                    timeout=LLM_TIMEOUT
+                )
+            
+            return result.stdout.strip()
+        except subprocess.TimeoutExpired:
+            logger.error(f"LLM call timed out for text: {text}")
+            return text
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Error calling llm: {e}")
+            if e.stderr:
+                logger.error(f"stderr: {e.stderr}")
+            return text
+        except Exception as e:
+            logger.error(f"Unexpected error calling llm: {e}")
+            return text
+
+class FileProcessor:
+    """Main file processing logic"""
+    
+    def __init__(self, id_config: IDConfig, processing_config: ProcessingConfig):
+        self.id_config = id_config
+        self.processing_config = processing_config
+        self.id_extractor = IDExtractor()
+        self.text_processor = TextProcessor()
+        self.llm_caller = LLMCaller()
+        self.file_extractor = FileExtractor()
+    
+    def process_group(self, base_name: str, filepaths: List[Path]) -> List[Tuple[Path, Path]]:
+        """Process a group of files and return rename operations"""
+        logger.info(f"Processing group: {base_name}")
+        logger.debug(f"Files: {[f.name for f in filepaths]}")
+        
+        unique_ids = self.id_extractor.extract_unique_ids(base_name, self.id_config)
+        logger.debug(f"Unique IDs found: {unique_ids}")
+        
+        text_for_translation = self.text_processor.remove_ids_from_text(base_name, unique_ids)
+        logger.debug(f"Text for translation: '{text_for_translation}'")
+        
+        if not text_for_translation.strip():
+            logger.info(f"Skipping group: No translatable text found in '{base_name}'")
+            return []
+        
+        translated = self._translate_text(text_for_translation)
+        sanitized = self.text_processor.sanitize_filename(translated)
+        new_base = self._construct_new_base(sanitized, unique_ids)
+        
+        return self._prepare_rename_operations(filepaths, new_base)
+    
+    def _translate_text(self, text: str) -> str:
+        """Translate text using LLM"""
+        logger.info(f"Translating: '{text}'")
+        translated = self.llm_caller.call_llm(
+            text, 
+            self.processing_config.model, 
+            self.processing_config.template
+        )
+        logger.debug(f"LLM returned: '{translated}'")
+        return translated
+    
+    def _construct_new_base(self, sanitized: str, unique_ids: List[str]) -> str:
+        """Construct new base name with IDs"""
+        if unique_ids:
+            main_id = max(unique_ids, key=len)
+            new_base = f"{sanitized}_{main_id}"
+        else:
+            new_base = sanitized
+        
+        # Apply length limit
+        if len(new_base) > self.processing_config.max_length:
+            if unique_ids:
+                main_id = max(unique_ids, key=len)
+                max_sanitized_len = self.processing_config.max_length - len(main_id) - 1
+                sanitized = sanitized[:max_sanitized_len]
+                new_base = f"{sanitized}_{main_id}"
+            else:
+                new_base = sanitized[:self.processing_config.max_length]
+        
+        return new_base
+    
+    def _prepare_rename_operations(self, filepaths: List[Path], new_base: str) -> List[Tuple[Path, Path]]:
+        """Prepare rename operations for all files in group"""
+        rename_operations = []
+        
+        logger.info("Preview:")
+        for filepath in filepaths:
+            _, extensions = self.file_extractor.extract_extensions(
+                filepath.name, 
+                self.processing_config.max_extensions
+            )
+            new_filename = new_base + extensions
+            new_filepath = filepath.parent / new_filename
+            
+            logger.info(f"  {filepath.name} -> {new_filename}")
+            rename_operations.append((filepath, new_filepath))
+        
+        return rename_operations
+
+def validate_files(filepaths: List[str]) -> List[Path]:
+    """Validate input files and return Path objects"""
+    valid_files = []
+    for filepath in filepaths:
+        path = Path(filepath)
+        if not path.exists():
+            logger.warning(f"File does not exist: {filepath}")
+            continue
+        if not path.is_file():
+            logger.warning(f"Not a regular file: {filepath}")
+            continue
+        valid_files.append(path)
+    return valid_files
+
+def safe_rename(old_path: Path, new_path: Path) -> bool:
+    """Safely rename a file with proper error handling"""
+    try:
+        if new_path.exists():
+            logger.warning(f"Target file already exists: {new_path}")
+            return False
+        
+        old_path.rename(new_path)
+        return True
+    except OSError as e:
+        logger.error(f"Error renaming {old_path.name}: {e}")
+        return False
+
+def group_files_by_base_name(filepaths: List[Path], max_extensions: int) -> Dict[str, List[Path]]:
+    """Group files by their base name"""
+    file_groups = defaultdict(list)
+    for filepath in filepaths:
+        base_name = FileExtractor.extract_base_name(filepath.name, max_extensions)
+        file_groups[base_name].append(filepath)
+    return dict(file_groups)
+
+def confirm_rename_operations(rename_operations: List[Tuple[Path, Path]], auto_accept: bool) -> bool:
+    """Ask for confirmation before renaming"""
+    if auto_accept:
+        logger.info("Auto-accepting group...")
+        return True
+    
+    try:
+        confirm = input(f"\nRename all {len(rename_operations)} files in this group? [y/N]: ").strip().lower()
+        return confirm in ['y', 'yes']
+    except (EOFError, KeyboardInterrupt):
+        logger.info("Operation cancelled by user")
+        return False
+
+def execute_rename_operations(rename_operations: List[Tuple[Path, Path]]) -> int:
+    """Execute rename operations and return success count"""
+    success_count = 0
+    for old_path, new_path in rename_operations:
+        if safe_rename(old_path, new_path):
+            success_count += 1
+    return success_count
+
+def _add_basic_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add basic arguments to parser"""
+    parser.add_argument('files', nargs='+', help='Files to rename')
+    parser.add_argument('-l', '--max-length', type=int, default=DEFAULT_MAX_LENGTH, 
+                       help=f'Maximum filename length (default: {DEFAULT_MAX_LENGTH})')
+    parser.add_argument('-y', '--yes', action='store_true', help='Auto-accept all renames')
+    parser.add_argument('--max-extensions', type=int, default=DEFAULT_MAX_EXTENSIONS, 
+                       help=f'Maximum number of extensions to preserve (default: {DEFAULT_MAX_EXTENSIONS})')
+    parser.add_argument('-d', '--delay', type=float, default=DEFAULT_DELAY, 
+                       help=f'Seconds to wait between translations (default: {DEFAULT_DELAY})')
+    parser.add_argument('--debug', action='store_true', help='Enable debug output')
+
+def _add_llm_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add LLM-related arguments to parser"""
+    llm_group = parser.add_argument_group('LLM Options')
+    llm_group.add_argument('-m', '--model', help='LLM model to use')
+    llm_group.add_argument('-t', '--template', help='LLM template to use')
+
+def _add_id_detection_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add ID detection arguments to parser"""
+    id_group = parser.add_argument_group('ID Detection Options')
+    id_group.add_argument('--youtube-id', action='store_true', help='Detect YouTube-style IDs (11 chars)')
+    id_group.add_argument('--uuid', action='store_true', help='Detect UUIDs')
+    id_group.add_argument('--numeric-id', action='store_true', help='Detect numeric IDs')
+    id_group.add_argument('--numeric-min-length', type=int, default=6, 
+                         help='Minimum length for numeric IDs (default: 6)')
+    id_group.add_argument('--mixed-id', action='store_true', help='Detect mixed alphanumeric IDs')
+    id_group.add_argument('--mixed-min-length', type=int, default=8, 
+                         help='Minimum length for mixed IDs (default: 8)')
+    id_group.add_argument('--bracketed-id', action='store_true', help='Detect IDs in brackets/parentheses')
+    id_group.add_argument('--bracketed-min-length', type=int, default=3, 
+                         help='Minimum length for bracketed IDs (default: 3)')
+    id_group.add_argument('--hash-id', action='store_true', help='Detect hashtag-style IDs (#id)')
+    id_group.add_argument('--hash-min-length', type=int, default=6, 
+                         help='Minimum length for hash IDs (default: 6)')
+    id_group.add_argument('--custom-pattern', help='Custom regex pattern for ID detection')
+
+def create_argument_parser() -> argparse.ArgumentParser:
+    """Create and configure argument parser"""
+    parser = argparse.ArgumentParser(
+        description='Translate filenames using LLM',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s file1.txt file2.txt
+  %(prog)s --youtube-id --bracketed-id *.mp4
+  %(prog)s -y -d 2 --numeric-id *.pdf
+        """
+    )
+    
+    _add_basic_arguments(parser)
+    _add_llm_arguments(parser)
+    _add_id_detection_arguments(parser)
+    
+    return parser
+
+def main() -> None:
+    """Main entry point"""
+    parser = create_argument_parser()
+    args = parser.parse_args()
+    
+    # Setup logging
+    setup_logging(args.debug)
+    
+    # Create configuration objects
+    id_config = IDConfig(
+        youtube=args.youtube_id,
+        uuid=args.uuid,
+        numeric=args.numeric_id,
+        numeric_min_length=args.numeric_min_length,
+        mixed=args.mixed_id,
+        mixed_min_length=args.mixed_min_length,
+        bracketed=args.bracketed_id,
+        bracketed_min_length=args.bracketed_min_length,
+        hash=args.hash_id,
+        hash_min_length=args.hash_min_length,
+        custom_pattern=args.custom_pattern
+    )
+    
+    processing_config = ProcessingConfig(
+        max_length=args.max_length,
+        max_extensions=args.max_extensions,
+        delay=args.delay,
+        auto_accept=args.yes,
+        model=args.model,
+        template=args.template,
+        debug=args.debug
+    )
+    
+    # Display configuration[1]
+    logger.info("Configuration:")
+    logger.info(f"  Max length: {processing_config.max_length}")
+    logger.info(f"  Auto-accept: {processing_config.auto_accept}")
+    logger.info(f"  LLM model: {processing_config.model or 'default'}")
+    logger.info(f"  LLM template: {processing_config.template or 'none'}")
+    logger.info(f"  Max extensions: {processing_config.max_extensions}")
+    logger.info(f"  Delay between translations: {processing_config.delay}s")
+    
+    # Show enabled ID detection
+    if id_config.has_any_enabled():
+        enabled_types = []
+        if id_config.youtube: enabled_types.append("youtube")
+        if id_config.uuid: enabled_types.append("uuid")
+        if id_config.numeric: enabled_types.append("numeric")
+        if id_config.mixed: enabled_types.append("mixed")
+        if id_config.bracketed: enabled_types.append("bracketed")
+        if id_config.hash: enabled_types.append("hash")
+        if id_config.custom_pattern: enabled_types.append("custom")
+        logger.info(f"  ID detection enabled: {', '.join(enabled_types)}")
+    else:
+        logger.info("  ID detection: disabled")
+    
+    logger.info("-" * 40)
+    
+    # Validate input files
+    valid_files = validate_files(args.files)
+    if not valid_files:
+        logger.error("No valid files to process")
+        sys.exit(1)
+    
+    # Group files by base name
+    file_groups = group_files_by_base_name(valid_files, processing_config.max_extensions)
+    
+    # Initialize processor
+    processor = FileProcessor(id_config, processing_config)
+    
+    # Process each group
+    group_count = 0
+    total_groups = len(file_groups)
+    
+    for base_name, filepaths in file_groups.items():
+        group_count += 1
+        
+        # Add delay before processing (except for the first group)
+        if processing_config.delay > 0 and group_count > 1:
+            logger.info(f"Waiting {processing_config.delay} seconds before next translation...")
+            time.sleep(processing_config.delay)
+        
+        logger.info(f"\nProcessing group {group_count}/{total_groups}: {base_name}")
+        
+        rename_operations = processor.process_group(base_name, filepaths)
+        if not rename_operations:
+            continue
+        
+        # Ask for confirmation
+        if confirm_rename_operations(rename_operations, processing_config.auto_accept):
+            success_count = execute_rename_operations(rename_operations)
+            logger.info(f"Successfully renamed {success_count}/{len(rename_operations)} files")
+        else:
+            logger.info("Skipped group.")
+    
+    logger.info("-" * 40)
+    logger.info("Processing complete!")
+
+if __name__ == '__main__':
+    main()
